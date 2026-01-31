@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import tempfile
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -92,34 +92,46 @@ with st.sidebar:
     else:
         st.markdown('Status: <span class="status-wait">Waiting for Data...</span>', unsafe_allow_html=True)
 
-# --- CORE LOGIC ---
+# --- CORE LOGIC (OPTIMIZED) ---
+@st.cache_resource
+def get_embeddings():
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
 def process_pdfs(files):
     all_docs = []
-    with st.spinner("Processing Documents..."):
-        for file in files:
-            # Save to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(file.getvalue())
-                tmp_path = tmp_file.name
-            
-            try:
-                loader = PyPDFLoader(tmp_path)
-                docs = loader.load()
-                # Add source metadata manually if loader doesn't
-                for doc in docs:
-                    doc.metadata["source"] = file.name
-                all_docs.extend(docs)
-            finally:
-                os.remove(tmp_path)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, file in enumerate(files):
+        status_text.text(f"Processing: {file.name}...")
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(file.getvalue())
+            tmp_path = tmp_file.name
         
-        # Split text
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(all_docs)
+        try:
+            # PyMuPDFLoader is ~10x faster than PyPDFLoader
+            loader = PyMuPDFLoader(tmp_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata["source"] = file.name
+            all_docs.extend(docs)
+        finally:
+            os.remove(tmp_path)
         
-        # Create Embeddings & Vector Store
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vector_store = FAISS.from_documents(splits, embeddings)
-        return vector_store
+        progress_bar.progress((i + 1) / len(files))
+
+    status_text.text("Splitting text into chunks...")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(all_docs)
+    
+    status_text.text("Generating vector embeddings (First time may take a minute)...")
+    embeddings = get_embeddings()
+    vector_store = FAISS.from_documents(splits, embeddings)
+    
+    status_text.empty()
+    progress_bar.empty()
+    return vector_store
 
 if uploaded_files and not st.session_state.vector_store:
     st.session_state.vector_store = process_pdfs(uploaded_files)
